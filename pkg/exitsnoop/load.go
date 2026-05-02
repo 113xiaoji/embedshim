@@ -37,9 +37,17 @@ var (
 // NewStoreFromAttach only opens but not pinned in bpffs, which has common
 // functionality with EnsureRunning. I think we should use options to merge
 // two function in the future.
-func NewStoreFromAttach() (_ *Store, retErr error) {
+func NewStoreFromAttach(opts ...Option) (_ *Store, retErr error) {
+	options, err := newOptions(opts...)
+	if err != nil {
+		return nil, err
+	}
+
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(progByteCode))
 	if err != nil {
+		return nil, err
+	}
+	if err := applyMapSizing(spec, options.mapMaxEntries); err != nil {
 		return nil, err
 	}
 
@@ -76,15 +84,26 @@ func NewStoreFromAttach() (_ *Store, retErr error) {
 
 // EnsureRunning makes sure that the exitsnoop has been pinned in BPF filesystem.
 func EnsureRunning(bpffsRoot string) error {
+	return EnsureRunningWithOptions(bpffsRoot)
+}
+
+// EnsureRunningWithOptions makes sure that exitsnoop has been pinned in BPF
+// filesystem with the requested loader options.
+func EnsureRunningWithOptions(bpffsRoot string, opts ...Option) error {
+	options, err := newOptions(opts...)
+	if err != nil {
+		return err
+	}
+
 	rootDir := filepath.Join(bpffsRoot, pinnedDir)
 
 	if err := ensureBPFFsMount(rootDir); err != nil {
 		return err
 	}
 
-	_, err := os.Stat(filepath.Join(rootDir, bpfProgName))
+	_, err = os.Stat(filepath.Join(rootDir, bpfProgName))
 	if err == nil {
-		return nil
+		return validatePinnedMapSizing(rootDir, options.mapMaxEntries)
 	}
 
 	if err != nil && !os.IsNotExist(err) {
@@ -102,6 +121,9 @@ func EnsureRunning(bpffsRoot string) error {
 
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(progByteCode))
 	if err != nil {
+		return err
+	}
+	if err := applyMapSizing(spec, options.mapMaxEntries); err != nil {
 		return err
 	}
 
@@ -175,6 +197,24 @@ func cleanupLeakyObjs(rootDir string) error {
 		bpfMapExitedEvents,
 	} {
 		if err := os.Remove(filepath.Join(rootDir, name)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func validatePinnedMapSizing(rootDir string, entries uint32) error {
+	for _, name := range []string{bpfMapTracingTasks, bpfMapExitedEvents} {
+		m, err := loadPinnedMap(filepath.Join(rootDir, name))
+		if err != nil {
+			return err
+		}
+		info, err := m.Info()
+		m.Close()
+		if err != nil {
+			return err
+		}
+		if err := validateMapMaxEntries(name, info.MaxEntries, entries); err != nil {
 			return err
 		}
 	}

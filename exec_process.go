@@ -19,7 +19,6 @@ package embedshim
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,11 +28,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fuweid/embedshim/pkg/exitsnoop"
 	"github.com/fuweid/embedshim/pkg/pidfd"
 	"github.com/fuweid/embedshim/pkg/runcext"
 
-	"github.com/cilium/ebpf"
 	"github.com/containerd/console"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/pkg/stdio"
@@ -297,8 +294,7 @@ func (e *execProcess) start(ctx context.Context) (retErr error) {
 			done    bool
 			err     error
 
-			pidMonitor    = e.pidMonitor()
-			execExitStore = pidMonitor.execStore
+			pidMonitor = e.pidMonitor()
 		)
 
 		defer func() {
@@ -319,60 +315,15 @@ func (e *execProcess) start(ctx context.Context) (retErr error) {
 					return err
 				}
 
-				err = func() (retErr error) {
-					pidMonitor.Lock()
-					defer pidMonitor.Unlock()
-
-					execPid = msg.Pid
-
-					nsInfo, err := getPidnsInfo(execPid)
-					if err != nil {
-						return err
-					}
-
-					pidFD, err = pidfd.Open(execPid, 0)
-					if err != nil {
-						return err
-					}
-
-					defer func() {
-						if retErr != nil {
-							unix.Close(int(pidFD))
-						}
-					}()
-
-					return execExitStore.Trace(execPid,
-						&exitsnoop.TaskInfo{
-							TraceID:   e.traceEventID,
-							PidnsInfo: nsInfo,
-						},
-					)
-				}()
+				execPid = msg.Pid
+				pidFD, err = pidMonitor.traceExecProcess(e, execPid)
 				if err != nil {
 					return err
 				}
 				return runcext.WriteProcSyncMessage(syncPipe, runcext.NewProcSyncExecPidDoneMessage())
 
 			case runcext.ProcSyncExecStatus:
-				err = func() error {
-					if !msg.Exited {
-						return nil
-					}
-
-					pidMonitor.Lock()
-					defer pidMonitor.Unlock()
-
-					taskInfo, err := execExitStore.GetTracingTask(execPid)
-					if err == nil && taskInfo.TraceID == e.traceEventID {
-						err = execExitStore.DeleteTracingTask(execPid)
-					}
-
-					if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-						return err
-					}
-
-					return execExitStore.ExitedEventFromWaitStatus(e.traceEventID, execPid, msg.ExitedStatus)
-				}()
+				err = pidMonitor.recordExecExitedStatus(e, execPid, msg.Exited, msg.ExitedStatus)
 				if err != nil {
 					return err
 				}
@@ -395,20 +346,7 @@ func (e *execProcess) start(ctx context.Context) (retErr error) {
 
 		e.pid.pid = int(execPid)
 		e.pidFD = pidFD
-		return pidMonitor.pidPoller.Add(pidFD, func() error {
-			execPid := e.Pid()
-
-			status := 255
-
-			event, err := execExitStore.GetExitedEvent(e.traceEventID)
-			if err == nil && event.Pid == uint32(execPid) {
-				status = int(event.ExitCode)
-			}
-			execExitStore.DeleteExitedEvent(e.traceEventID)
-
-			e.SetExited(status)
-			return nil
-		})
+		return pidMonitor.pollExecProcess(e, pidFD)
 	})
 	if invokeErr != nil {
 		close(e.waitBlock)

@@ -7,6 +7,7 @@ import (
 
 	pkgbundle "github.com/fuweid/embedshim/pkg/bundle"
 	"github.com/fuweid/embedshim/pkg/exitsnoop"
+	"github.com/fuweid/embedshim/pkg/pidfd"
 
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/events/exchange"
@@ -28,7 +29,16 @@ var (
 	traceEventIDDBName = "trace_event_id.db"
 )
 
-type Config struct{}
+type Config struct {
+	BPFMapMaxEntries        uint32 `toml:"bpf_map_max_entries"`
+	EpollBatchSize          int    `toml:"epoll_batch_size"`
+	PIDFDCallbackWorkers    int    `toml:"pidfd_callback_workers"`
+	PIDFDCallbackQueueDepth int    `toml:"pidfd_callback_queue_depth"`
+	ARMAffinityMode         string `toml:"arm_affinity_mode"`
+	ARMAffinitySharding     string `toml:"arm_affinity_sharding"`
+	ARMAffinityBindWorkers  bool   `toml:"arm_affinity_bind_workers"`
+	TopologySysfsRoot       string `toml:"topology_sysfs_root"`
+}
 
 func init() {
 	plugin.Register(&plugin.Registration{
@@ -162,7 +172,10 @@ func (manager *TaskManager) Tasks(ctx context.Context, all bool) ([]runtime.Task
 }
 
 func (manager *TaskManager) init() (retErr error) {
-	err := exitsnoop.EnsureRunning(manager.rootDir)
+	err := exitsnoop.EnsureRunningWithOptions(
+		manager.rootDir,
+		exitsnoop.WithMapMaxEntries(manager.config.BPFMapMaxEntries),
+	)
 	if err != nil {
 		return err
 	}
@@ -177,7 +190,7 @@ func (manager *TaskManager) init() (retErr error) {
 		}
 	}()
 
-	manager.monitor, err = newMonitor(manager.rootDir)
+	manager.monitor, err = newMonitor(manager.rootDir, manager.config)
 	if err != nil {
 		return err
 	}
@@ -197,7 +210,11 @@ func (manager *TaskManager) repollingInitProcess(init *initProcess) error {
 }
 
 func (manager *TaskManager) cleanInitProcessTraceEvent(init *initProcess) error {
-	return manager.monitor.initStore.DeleteExitedEvent(init.traceEventID)
+	return manager.monitor.cleanInitProcessTraceEvent(init)
+}
+
+func (manager *TaskManager) monitorMetricsSnapshot() pidfd.MetricsSnapshot {
+	return manager.monitor.metricsSnapshot()
 }
 
 func initOptionsFromCreateOpts(createOpts runtime.CreateOpts) (*options.Options, error) {

@@ -9,8 +9,6 @@ import (
 
 type pidOnClose func() error
 
-var maxEvents = 128
-
 // Epoller is used to monitor PID file descriptors.
 //
 // When the process that PID file descriptor refers to terminates, these
@@ -20,19 +18,40 @@ type Epoller struct {
 	mu         sync.Mutex
 	efd        int
 	closeOnce  sync.Once
+	maxEvents  int
+	dispatcher *callbackDispatcher
+	metrics    *Metrics
+
 	fdOnCloses map[FD]pidOnClose
 }
 
-func NewEpoller() (*Epoller, error) {
+func NewEpoller(opts ...Option) (*Epoller, error) {
+	options, err := newOptions(opts...)
+	if err != nil {
+		return nil, err
+	}
+
 	efd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Epoller{
+	dispatcher := newCallbackDispatcherWithCPUSets(
+		options.callbackWorkers,
+		options.callbackQueueDepth,
+		options.metrics,
+		options.workerCPUSets,
+	)
+	dispatcher.start()
+
+	e := &Epoller{
 		efd:        efd,
+		maxEvents:  options.maxEvents,
+		dispatcher: dispatcher,
+		metrics:    options.metrics,
 		fdOnCloses: make(map[FD]pidOnClose),
-	}, nil
+	}
+	return e, nil
 }
 
 // Add monitors the PID file descriptor and registers the onClose for it.
@@ -59,7 +78,7 @@ func (e *Epoller) Add(fd FD, onClose func() error) error {
 
 // Run starts to monitor the event on PID file descriptor.
 func (e *Epoller) Run() error {
-	events := make([]unix.EpollEvent, maxEvents)
+	events := make([]unix.EpollEvent, e.maxEvents)
 
 	for {
 		n, err := unix.EpollWait(e.efd, events, -1)
@@ -74,6 +93,8 @@ func (e *Epoller) Run() error {
 		}
 
 		for i := 0; i < n; i++ {
+			e.metrics.incEpollEvents()
+
 			fd := FD(events[i].Fd)
 
 			err := unix.EpollCtl(e.efd, unix.EPOLL_CTL_DEL, int(fd), &unix.EpollEvent{})
@@ -88,17 +109,27 @@ func (e *Epoller) Run() error {
 
 			e.mu.Unlock()
 
-			// TODO(fuweid): non-block mode to run onClose?
 			unix.Close(int(fd))
-			onClose()
+			if onClose == nil {
+				continue
+			}
+			if err := e.dispatcher.dispatch(onClose); err != nil {
+				return err
+			}
 		}
 	}
+}
+
+// Metrics returns a point-in-time snapshot of epoll and callback counters.
+func (e *Epoller) Metrics() MetricsSnapshot {
+	return e.dispatcher.metricsSnapshot()
 }
 
 // Close stops the monitor.
 func (e *Epoller) Close() error {
 	e.closeOnce.Do(func() {
 		unix.Close(e.efd)
+		e.dispatcher.close()
 	})
 	return nil
 }

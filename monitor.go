@@ -13,6 +13,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
@@ -29,8 +30,17 @@ type monitor struct {
 	execStore *exitsnoop.Store
 }
 
-func newMonitor(stateDir string) (_ *monitor, retErr error) {
-	epoller, err := pidfd.NewEpoller()
+func newMonitor(stateDir string, cfg *Config) (_ *monitor, retErr error) {
+	if cfg == nil {
+		cfg = &Config{}
+	}
+
+	epoller, err := pidfd.NewEpoller(
+		pidfd.WithMaxEvents(cfg.EpollBatchSize),
+		pidfd.WithCallbackWorkers(cfg.PIDFDCallbackWorkers),
+		pidfd.WithCallbackQueueDepth(cfg.PIDFDCallbackQueueDepth),
+		pidfd.WithWorkerCPUSets(pidfdWorkerCPUSetsFromConfig(cfg)),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -50,7 +60,9 @@ func newMonitor(stateDir string) (_ *monitor, retErr error) {
 		}
 	}()
 
-	execStore, err := exitsnoop.NewStoreFromAttach()
+	execStore, err := exitsnoop.NewStoreFromAttach(
+		exitsnoop.WithMapMaxEntries(cfg.BPFMapMaxEntries),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -60,10 +72,22 @@ func newMonitor(stateDir string) (_ *monitor, retErr error) {
 		initStore: initStore,
 		execStore: execStore,
 	}
+	publishMonitorMetrics(m)
 
-	// TODO: check the return
-	go m.pidPoller.Run()
+	go func() {
+		if err := m.pidPoller.Run(); err != nil {
+			logrus.WithError(err).Error("pidfd epoller stopped")
+		}
+	}()
 	return m, nil
+}
+
+func (m *monitor) metricsSnapshot() pidfd.MetricsSnapshot {
+	return m.pidPoller.Metrics()
+}
+
+func (m *monitor) cleanInitProcessTraceEvent(init *initProcess) error {
+	return m.initStore.DeleteExitedEvent(init.traceEventID)
 }
 
 // traceInitProcess checks init process is alive and starts to trace it's exit
@@ -207,6 +231,71 @@ set_exitedstatus:
 
 	init.SetExited(int(exitedStatus.ExitCode))
 	return nil
+}
+
+func (m *monitor) traceExecProcess(exec *execProcess, execPid uint32) (_ pidfd.FD, retErr error) {
+	m.Lock()
+	defer m.Unlock()
+
+	nsInfo, err := getPidnsInfo(execPid)
+	if err != nil {
+		return 0, err
+	}
+
+	fd, err := pidfd.Open(execPid, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if retErr != nil {
+			unix.Close(int(fd))
+		}
+	}()
+
+	if err := m.execStore.Trace(execPid, &exitsnoop.TaskInfo{
+		TraceID:   exec.traceEventID,
+		PidnsInfo: nsInfo,
+	}); err != nil {
+		return 0, err
+	}
+	return fd, nil
+}
+
+func (m *monitor) recordExecExitedStatus(exec *execProcess, execPid uint32, exited bool, status uint32) error {
+	if !exited {
+		return nil
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	taskInfo, err := m.execStore.GetTracingTask(execPid)
+	if err == nil && taskInfo.TraceID == exec.traceEventID {
+		err = m.execStore.DeleteTracingTask(execPid)
+	}
+
+	if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return err
+	}
+
+	return m.execStore.ExitedEventFromWaitStatus(exec.traceEventID, execPid, status)
+}
+
+func (m *monitor) pollExecProcess(exec *execProcess, fd pidfd.FD) error {
+	return m.pidPoller.Add(fd, func() error {
+		execPid := exec.Pid()
+
+		status := 255
+
+		event, err := m.execStore.GetExitedEvent(exec.traceEventID)
+		if err == nil && event.Pid == uint32(execPid) {
+			status = int(event.ExitCode)
+		}
+		m.execStore.DeleteExitedEvent(exec.traceEventID)
+
+		exec.SetExited(status)
+		return nil
+	})
 }
 
 func getPidnsInfo(pid uint32) (exitsnoop.PidnsInfo, error) {

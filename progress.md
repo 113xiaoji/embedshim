@@ -1,0 +1,53 @@
+# Embedshim Analysis Progress
+
+## 2026-05-02
+- Created analysis plan and findings log.
+- Read README, Makefile, go.mod, and repository file list. Established the high-level purpose and build outputs.
+- Traced plugin, shim, monitor, BPF, pidfd, exec-wrapper, reload, bundle, and IO paths.
+- Attempted `go test ./...`; failed because Go is unavailable in this workspace PATH.
+- Completed synthesis for repository role, kernel dependency, Kunpeng affinity opportunities, and microarchitecture competitiveness.
+- Added concrete optimization plan covering configurable capacity, unified exit monitor, async epoll callbacks, Kunpeng NUMA sharding, observability, and validation.
+- Wrote ARM affinity runtime design document at `docs/superpowers/specs/2026-05-02-arm-affinity-runtime-design.md` and self-reviewed it for placeholders.
+- Wrote implementation plan at `docs/superpowers/plans/2026-05-02-arm-affinity-runtime-implementation.md`.
+- Added `pkg/exitsnoop/options.go` and `pkg/exitsnoop/options_test.go`.
+- Wired `bpf_map_max_entries` through plugin config into pinned init BPF and exec attach BPF load paths.
+- Added validation for already-pinned BPF maps so a capacity change fails clearly instead of silently reusing a mismatched pinned map.
+- Added containerd plugin config example to the ARM affinity design doc.
+- Added read-only topology foundation in `pkg/topology`: Linux CPU list parsing and NUMA node CPU discovery from sysfs.
+- Verification: `rg -n "TBD|TODO|FIXME|\?\?" docs/superpowers/specs/2026-05-02-arm-affinity-runtime-design.md` returned no matches.
+- Verification: `git diff --check` completed without whitespace errors; Git only warned that some touched tracked files will be normalized from LF to CRLF when Git next touches them.
+- Verification blocked: `gofmt -w ...` could not run because `gofmt` is not installed/on PATH in this workspace.
+- Verification blocked: Go tests could not run because `go` is not installed/on PATH in this workspace.
+- Wrote second-stage implementation plan at `docs/superpowers/plans/2026-05-02-pidfd-async-callbacks-implementation.md`.
+- Added `pkg/pidfd/options.go` and tests for epoll batch size, callback worker count, and queue depth options.
+- Added `pkg/pidfd/dispatcher.go` and dispatcher tests for callback execution and queue backpressure.
+- Updated `pkg/pidfd/epoll.go` so `Run()` removes and closes pidfds, then enqueues callbacks instead of invoking them inline.
+- Exposed `epoll_batch_size`, `pidfd_callback_workers`, and `pidfd_callback_queue_depth` through plugin config and documented them in the ARM affinity design doc.
+- Verification blocked: `go test ./pkg/pidfd -run "TestOptions|TestCallbackDispatcher" -count=1`, `go test ./pkg/pidfd -count=1`, and `go test ./...` could not run because `go` is not installed/on PATH.
+- Added pidfd metrics counters and `MetricsSnapshot`, including epoll events, queued/started/completed callbacks, callback errors, dispatch errors, queue backpressure, affinity errors, and queue depth.
+- Published monitor pidfd metrics through standard `expvar` key `embedshim_pidfd`.
+- Added `exitMonitor` interface boundary and moved exec trace/status/poll behavior behind monitor methods.
+- Added topology cgroup placement and NUMA shard helpers, with tests for cgroup effective cpuset/memset and shard selection.
+- Added opt-in ARM runtime-only worker affinity: `arm_affinity_mode`, `arm_affinity_sharding`, `arm_affinity_bind_workers`, and `topology_sysfs_root`.
+- Added pidfd worker affinity support via per-worker CPU sets and Linux `sched_setaffinity`.
+- Added Makefile targets `binaries-arm64-generic` and `binaries-arm64-lse`.
+- Added Linux validation scripts `hack/churn-bench.sh` and `hack/arm-affinity-env.sh`.
+- Verification blocked: `go test ./pkg/topology -count=1` and `go test ./...` could not run because `go` is not installed/on PATH.
+- Verification blocked: `make -n binaries-arm64-generic` and `make -n binaries-arm64-lse` could not run because `make` is not installed/on PATH.
+- Remote ARM64 verification host: `124.70.162.35`, Huawei Cloud EulerOS 2.0, Linux 5.10, `aarch64`.
+- Remote setup notes: installed missing ELF/pkg-config build dependencies, used temporary Go 1.21.13 from `/tmp/go1.21.13`, used `GOPROXY=https://goproxy.cn,direct`, and built BPF with `CLANG=clang-12` because the default BiSheng clang did not support the BPF target.
+- Remote BPF generation passed after fixing the remote verification copy's `bpf/vmlinux/vmlinux.h` symlink and running `make -C bpf CLANG=clang-12 LLVM_STRIP=llvm-strip` plus `go generate ./...`.
+- Remote verification passed: `go test ./... -count=1` with Go 1.21.13. Passing packages included repository root, `pkg/exitsnoop`, `pkg/pidfd`, and `pkg/topology`.
+- Remote ARM64 build targets passed: `make binaries-arm64-generic CLANG=clang-12` and `make binaries-arm64-lse CLANG=clang-12`.
+- Remote binary inspection passed: `bin/embedshim-containerd` and `bin/embedshim-runcext` are ELF 64-bit ARM aarch64 executables.
+- Remote environment script passed: `bash hack/arm-affinity-env.sh` reported `aarch64`, HiSilicon vendor information, 8 CPUs, one NUMA node, and ARM feature flags including atomics/SVE.
+- Remote churn benchmark blocked: `bash hack/churn-bench.sh` exited with `ctr is required`; the host has containerd/runc binaries but lacks the containerd CLI needed by the script.
+- Installed official ARM64 `ctr` v1.7.27 to `/usr/local/bin/ctr` on the remote host, without replacing the system `/usr/bin/containerd`.
+- Verified `ctr` could connect to Docker's containerd socket at `/var/run/docker/containerd/containerd.sock`, but that path was not used for final churn validation because it is Docker-managed and did not have the target image in the containerd namespace.
+- Started a temporary isolated `embedshim-containerd` from the freshly built `bin/embedshim-containerd` with socket `/tmp/embedshim-run/containerd.sock`, root `/tmp/embedshim-run/root`, and state `/tmp/embedshim-run/state`.
+- Confirmed the temporary daemon loaded `io.containerd.runtime.v1.embed` and served on the isolated socket.
+- Imported the remote host's existing Docker image `quay.io/almalinuxorg/9-base:9.4` into the isolated containerd namespace with `docker save ... | ctr ... images import -`.
+- Remote churn validation passed with `COUNT=1`, `IMAGE=quay.io/almalinuxorg/9-base:9.4`, `COMMAND=/bin/true`, and `RUNTIME=io.containerd.runtime.v1.embed`: elapsed 65 ms, 15 containers/s.
+- Remote churn validation passed with `COUNT=1000` under the same embed runtime setup: elapsed 52497 ms, 19 containers/s.
+- Checked `/tmp/embedshim-run/containerd.log`; the only matched error was the expected CRI CNI initialization warning for the temporary daemon, while the churn run itself completed successfully. Runtime v1 deprecation warnings were emitted repeatedly by containerd.
+- Stopped the temporary `embedshim-containerd` process after validation; `/tmp/embedshim-run/containerd.log` remains on the remote host for inspection.
